@@ -5,6 +5,7 @@ import math
 import sys
 import pickle
 import scipy.io
+import tqdm
 
 
 debug = False
@@ -110,50 +111,84 @@ Wo = np.random.uniform(-std, std, size=(input_size, hidden_size))
 Bo = np.random.uniform(-std, std, size=(input_size, 1))
 
 
-def forward(input):
-
+def forward(input, epsilon=None):
     # YOUR FORWARD PASS FROM HERE
     batch_size = input.shape[-1]
+
+    H_e = np.zeros([hidden_size, batch_size])
+    mean = np.zeros([latent_size, batch_size])
+    logvar = np.zeros([latent_size, batch_size])
+    z = np.zeros([latent_size, batch_size])
+    H_d = np.zeros([hidden_size, batch_size])
+    output = np.zeros([input_size, batch_size])
+    p = np.zeros([input_size, batch_size])
 
     if input.ndim == 1:
         input = np.expand_dims(input, axis=1)
 
     # (1) linear
     # H = W_i \times input + Bi
+    # np.dot(Wi, input, out=H_e)
+    # H_e += Bi
+    H_e = np.dot(Wi, input) + Bi
 
     # (2) ReLU
     # H = ReLU(H)
+    H_e = relu(H_e)
 
     # (3) h > mu
     # Estimate the means of the latent distributions
     # mean = Wm \times H + Bm
+    # np.dot(Wm, H_e, out=mean)
+    # mean += Bm
+    mean = np.dot(Wm, H_e) + Bm
 
     # (4) h > log var
     # Estimate the (diagonal) variances of the latent distributions
     # logvar = Wv \times H + Bv
+    # np.dot(Wv, H_e, out=logvar)
+    # logvar += Bv
+    logvar = np.dot(Wv, H_e) + Bv
 
     # (5) sample the random variable z from means and variances (refer to the "reparameterization trick" to do this)
+    if epsilon is None:
+        epsilon = sample_unit_gaussian(latent_size=[latent_size, batch_size])
+    # np.multiply(epsilon, np.exp(logvar/2), out=z)
+    # z += mean
+    z = np.multiply(epsilon, np.exp(logvar/2)) + mean
 
     # (6) decode z
     # D = Wd \times z + Bd
+    # np.dot(Wd, z, out=H_d)
+    # H_d += Bd
+    H_d = np.dot(Wd, z) + Bd
 
     # (7) relu
     # D = ReLU(D)
+    H_d = relu(H_d)
 
     # (8) dec to output
     # output = Wo \times D + Bo
+    # np.dot(Wo, H_d, out=output)
+    # output += Bo
+    output = np.dot(Wo, H_d) + Bo
 
     # # (9) dec to p(x)
+
     # and (10) reconstruction loss function (same as the
     if loss_function == 'bce':
-
+        p = sigmoid(output)
+        loss = -np.sum(np.multiply(input, np.log(p)) + np.multiply(1 - input, np.log(1 - p)))
         # BCE Loss
 
     elif loss_function == 'mse':
-
+        p = output
+        loss = np.sum(0.5 * (p - input)**2)
         # MSE Loss
 
     # variational loss with KL Divergence between P(z|x) and U(0, 1)
+    kl_div_loss = -1/2 * np.sum(1 + logvar - mean**2 - np.exp(logvar))
+    # kl_div_loss = 0
 
     #kl_div_loss = - 0.5 * (1 + logvar - mean^2 - e^logvar)
 
@@ -162,8 +197,8 @@ def forward(input):
 
     # Store the activations for the backward pass
     # activations = ( ... )
-
-    return loss, kl_div_loss, activations
+    activations = (epsilon, H_e, mean, logvar, z, H_d, output, p)
+    return loss+kl_div_loss, kl_div_loss, activations
 
 
 def decode(z):
@@ -171,8 +206,15 @@ def decode(z):
     # basically the decoding part in the forward pass: maaping z to p
 
     # o = W_d \times z + B_d
+    H_d = np.dot(Wd, z) + Bd
+    H_d = relu(H_d)
+    output = np.dot(Wo, H_d) + Bo
 
     # p = sigmoid(o) if bce or o if mse
+    if loss_function == 'bce':
+        p = sigmoid(output)
+    elif loss_function == 'mse':
+        p = output
 
     return p
 
@@ -193,21 +235,67 @@ def backward(input, activations, scale=True, alpha=1.0):
     batch_size = input.shape[-1]
     scaler = batch_size if scale else 1
 
-    eps, h, mean, logvar, z, dec, output, p, _, _ = activations
+    # activations = (epsilon, H_e, mean, logvar, z, H_d, output, p)
+    eps, H_e, mean, logvar, z, H_d, output, p = activations
 
-    # Perform your BACKWARD PASS (similar to the auto-encoder code)
+    # backprop from (8) and (9) (if there is an additional activation function)
+    if loss_function == 'mse':
+        dp = p - input
+        dp = dp / scaler
+        do = dp
 
-    # 1st Note:
-    # When performing the BW Pass for mean and logvar, note that they should have 2 different terms
-    # One coming from the reconstruction loss, and backprop-ed through the hidden layer z
-    # One coming from the KL divergence loss
-    # So you should sum them up to have the correct gradient
+    elif loss_function == 'bce':
+        dp = -1 * (input / p - (1 - input) / (1 - p))
+        dp = dp / scaler
+        do = np.multiply(dp, dsigmoid(p))
 
-    # 2nd Note:
-    # The z is a sample from the distribution P(z|x), this is backprop-able based on the reparameterization trick
-    # In order to do that, one random variable must stay the same between forward and backward passes.
+    # backprop from (7) through fully-connected
+    dH_d = np.dot(Wo.T, do)
+    dWo += np.dot(do, H_d.T)
+    dBo += np.sum(do, axis=-1, keepdims=True)
 
-    # The rest of the backward pass should be the same as the AE
+    # backprop from (6) through ReLU
+    dH_d = np.multiply(drelu(H_d), dH_d)
+
+    # backprop from (5) through fully-connected
+    dz = np.dot(Wd.T, dH_d)
+    dWd += np.dot(dH_d, z.T)
+    dBd += np.sum(dH_d, axis=-1, keepdims=True)
+
+    # FROM PIXEL LOSS
+    # backprop to mean
+    dMean = dz
+    dWm += np.dot(dMean, H_e.T)
+    dBm += np.sum(dMean, axis=-1, keepdims=True)
+    # backprop to mean
+    dVar = np.multiply(dz, 0.5 * eps * np.exp(logvar/2))
+    dWv += np.dot(dVar, H_e.T)
+    dBv += np.sum(dVar, axis=-1, keepdims=True)
+
+    # backprop to hidden state (encoder)
+    dH_e = np.dot(Wm.T, dMean) + np.dot(Wv.T, dVar)
+    dH_e = np.multiply(drelu(H_e), dH_e)
+
+    dWi += np.dot(dH_e, input.T)
+    dBi += np.sum(dH_e, axis=-1, keepdims=True)
+
+    # FROM KL_LOSS
+    dMean_KL = mean
+    dVar_KL = 0.5 * (np.exp(logvar) - 1)
+
+    # backprop to mean
+    dWm += np.dot(dMean_KL, H_e.T)
+    dBm += np.sum(dMean_KL, axis=-1, keepdims=True)
+    # backprop to mean
+    dWv += np.dot(dVar_KL, H_e.T)
+    dBv += np.sum(dVar_KL, axis=-1, keepdims=True)
+
+    # backprop to hidden state (encoder)
+    dH_e_KL = np.dot(Wm.T, dMean_KL) + np.dot(Wv.T, dVar_KL)
+    dH_e_KL = np.multiply(drelu(H_e), dH_e_KL)
+
+    dWi += np.dot(dH_e_KL, input.T)
+    dBi += np.sum(dH_e_KL, axis=-1, keepdims=True)
 
     gradients = (dWi, dWm, dWv, dWd, dWo, dBi, dBm, dBv, dBd, dBo)
 
@@ -268,11 +356,11 @@ def train():
             x_i = get_minibatch(batch_size, i, rand_indices)
             bsz = x_i.shape[-1]
 
-            loss, acts = forward(x_i, alpha=alpha)
-            _, _, _, _, z, _, _, _, rec_loss, kl_loss = acts
+            loss, kl_loss, acts = forward(x_i)
+            _, _, _, _, z, _, _, _ = acts
             # lol I computed kl_div again here
 
-            total_loss += rec_loss
+            total_loss += loss
             total_kl_loss += kl_loss
             total_pixels += bsz * 560
 
@@ -323,9 +411,8 @@ def grad_check():
 
     x = get_minibatch(batch_size)
 
-    actual_bsz = x.shape[-1]  # because x can be the last batch in the dataset which has bsz < 8
-
-    loss, acts = forward(x)
+    _, _, acts = forward(x)
+    epsilon = acts[0]
 
     gradients = backward(x, acts, scale=False)
 
@@ -335,31 +422,35 @@ def grad_check():
                                   [dWi, dWm, dWv, dWd, dWo, dBi, dBm, dBv, dBd, dBo],
                                   ['Wi', 'Wm', 'Wv', 'Wd', 'Wo', 'Bi', 'Bm', 'Bv', 'Bd', 'Bo']):
 
+        if name != 'Wv':
+            continue
+
         str_ = ("Dimensions dont match between weight and gradient %s and %s." % (weight.shape, grad.shape))
         assert (weight.shape == grad.shape), str_
 
         print("Checking grads for weights %s ..." % name)
         n_warnings = 0
-        for i in range(weight.size):
+        for i in tqdm.tqdm(range(weight.size)):
 
             w = weight.flat[i]
 
             weight.flat[i] = w + delta
-            loss_positive, _ = forward(x)
+            loss_positive, _, _ = forward(x, epsilon)
 
             weight.flat[i] = w - delta
-            loss_negative, _ = forward(x)
+            loss_negative, _, _ = forward(x, epsilon)
 
             weight.flat[i] = w  # reset old value for this parameter
 
             grad_analytic = grad.flat[i]
             grad_numerical = (loss_positive - loss_negative) / (2 * delta)
+            # print('Grad numerical: %f, grad analytical: %f' % (grad_numerical, grad_analytic))
 
-            rel_error = abs(grad_analytic - grad_numerical) / abs(grad_numerical + grad_analytic)
+            rel_error = abs(grad_analytic - grad_numerical) / (abs(grad_numerical + grad_analytic) + 1e-9)
 
             if rel_error > 0.001:
                 n_warnings += 1
-                # print('WARNING %f, %f => %e ' % (grad_numerical, grad_analytic, rel_error))
+                print('WARNING %f, %f => %e ' % (grad_numerical, grad_analytic, rel_error))
         print("%d gradient mismatch warnings found. " % n_warnings)
 
     return
@@ -400,9 +491,11 @@ def eval():
 
 def sample():
     while True:
-        cmd = input("Press anything to continue:  ")
+        cmd = input("Press anything to continue, press q to quit:  ")
+        if cmd == 'q':
+            break
 
-        z = np.random.randn(latent_size)
+        z = np.random.randn(latent_size) * 10
         z = np.expand_dims(z, 1)
 
         # The decode function should be implemented before this
@@ -418,6 +511,13 @@ def sample():
         plt.show(block=True)
 
 
+def forward_test():
+    batch_size = 10
+    indices = np.arange(batch_size)
+    rand_indices = np.random.permutation(indices)
+    x_i = get_minibatch(batch_size, 0, rand_indices)
+    return forward(x_i)
+
 if len(sys.argv) != 2:
     print("Need an argument train or gradcheck or reconstruct")
     exit()
@@ -428,16 +528,21 @@ if option == 'train':
     train()
 elif option in ['grad_check', 'gradcheck']:
     grad_check()
-elif option in ['eval', 'sample']:
+elif option in ['eval', 'sample', 'forward']:
 
     # read trained weights from file
-    with open('models/weights.vae.pkl', "rb") as f:
-        weights = pickle.load(f)
+    try:
+        with open('models/weights.vae.pkl', "rb") as f:
+            weights = pickle.load(f)
 
-    Wi, Wm, Wv, Wd, Wo, Bi, Bm, Bv, Bd, Bo = weights
+        Wi, Wm, Wv, Wd, Wo, Bi, Bm, Bv, Bd, Bo = weights
+    except:
+        print("No model weights found, inizializing random weights.")
 
     if option == 'eval':
         eval()
+    elif option == 'forward':
+        forward_test()
     else:
         sample()
 else:
